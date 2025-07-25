@@ -17,6 +17,11 @@ class Dipole(Element):
     Dipole magnet (by default a sector bending magnet).
 
     :param length: Length in meters.
+    :param p0c_ref: Reference energy of the beam, designated by user.
+        - Thus, it is different compared to that of the beam
+    :param ref_track: Key to track the beam trajectory with respect to p0c_ref
+        - "true": Apply tracking with respect to p0c_ref
+        - "false": Apply tracking with the reference of the current beam status
     :param angle: Deflection angle in rad.
     :param k1: Focussing strength in 1/m^-2. Only used with `"cheetah"` tracking method.
     :param dipole_e1: The angle of inclination of the entrance face in rad.
@@ -38,14 +43,13 @@ class Dipole(Element):
     :param fringe_type: Type of fringe field for `"bmadx"` tracking. Currently only
         supports `"linear_edge"`.
     :param name: Unique identifier of the element.
-    :param sanitize_name: Whether to sanitise the name to be a valid Python
-        variable name. This is needed if you want to use the `segment.element_name`
-        syntax to access the element in a segment.
     """
 
     def __init__(
         self,
         length: torch.Tensor,
+        p0c_ref: torch.Tensor,
+        ref_track: Literal["true", "false"] = "false",
         angle: torch.Tensor | None = None,
         k1: torch.Tensor | None = None,
         dipole_e1: torch.Tensor | None = None,
@@ -59,13 +63,14 @@ class Dipole(Element):
         fringe_type: Literal["linear_edge"] = "linear_edge",
         tracking_method: Literal["cheetah", "bmadx"] = "cheetah",
         name: str | None = None,
-        sanitize_name: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
+
         device, dtype = verify_device_and_dtype(
             [
                 length,
+                p0c_ref,
                 angle,
                 k1,
                 dipole_e1,
@@ -80,9 +85,10 @@ class Dipole(Element):
             dtype,
         )
         factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__(name=name, sanitize_name=sanitize_name, **factory_kwargs)
+        super().__init__(name=name, **factory_kwargs)
 
         self.length = torch.as_tensor(length, **factory_kwargs)
+        self.p0c_ref = torch.as_tensor(p0c_ref, **factory_kwargs)
 
         self.register_buffer_or_parameter(
             "angle",
@@ -135,6 +141,7 @@ class Dipole(Element):
             "tilt", torch.as_tensor(tilt if tilt is not None else 0.0, **factory_kwargs)
         )
 
+        self.ref_track = ref_track
         self.fringe_at = fringe_at
         self.fringe_type = fringe_type
         self.tracking_method = tracking_method
@@ -209,7 +216,19 @@ class Dipole(Element):
         delta = incoming.p
         mc2 = incoming.species.mass_eV
 
-        z, pz, p0c = bmadx.cheetah_to_bmad_z_pz(tau, delta, incoming.energy, mc2)
+        z, pz, p0c_particle_d = bmadx.cheetah_to_bmad_z_pz(
+            tau, delta, incoming.energy, mc2
+        )
+        # pz_orig = pz
+        p0c = p0c_particle_d
+
+        if self.ref_track == "true":
+            px = incoming.px * (incoming.p0c.unsqueeze(-1) / self.p0c_ref.unsqueeze(-1))
+            py = incoming.py * (incoming.p0c.unsqueeze(-1) / self.p0c_ref.unsqueeze(-1))
+            pz = incoming.p + (
+                (incoming.p0c.unsqueeze(-1) - self.p0c_ref.unsqueeze(-1))
+                / self.p0c_ref.unsqueeze(-1)
+            )
 
         # Begin Bmad-X tracking
         x, px, y, py = bmadx.offset_particle_set(
@@ -239,8 +258,11 @@ class Dipole(Element):
         )
         # End of Bmad-X tracking
 
-        # Convert back to Cheetah coordinates
-        tau, delta, ref_energy = bmadx.bmad_to_cheetah_z_pz(z, pz, p0c, mc2)
+        # 2025. 07. 11 Memo
+        # Convert back to Cheetah coordinates:
+        # in Cheetah simulation, reference beam energy is already specified.
+        # Therefore, we need to put the p back to the original (based on zero position)
+        tau, delta, ref_energy = bmadx.bmad_to_cheetah_z_pz(z, incoming.p, p0c, mc2)
 
         # Broadcast to align their shapes so that they can be stacked
         x, px, y, py, tau, delta = torch.broadcast_tensors(x, px, y, py, tau, delta)
@@ -249,7 +271,7 @@ class Dipole(Element):
             particles=torch.stack(
                 (x, px, y, py, tau, delta, torch.ones_like(x)), dim=-1
             ),
-            energy=ref_energy,
+            energy=incoming.p0c,
             particle_charges=incoming.particle_charges,
             survival_probabilities=incoming.survival_probabilities,
             s=incoming.s + self.length,
@@ -349,7 +371,10 @@ class Dipole(Element):
         z_f = (
             z
             + (beta * self.length.unsqueeze(-1) / beta0.unsqueeze(-1))
-            - ((1 + pz) * Lp / px_norm)
+            + (
+                (1 + pz) * Lp / px_norm
+            )  # In this line, sign should be + since head-tail convention
+            # is different compared to BmadX. Confirmed with elegant simulaton.
         )
 
         return x_f, px_f, y_f, py, z_f, pz
@@ -418,9 +443,7 @@ class Dipole(Element):
         R = R_exit @ R @ R_enter
 
         # Apply rotation for tilted magnets
-        if torch.any(self.tilt != 0):
-            rotation = rotation_matrix(self.tilt)
-            R = rotation.transpose(-1, -2) @ R @ rotation
+        R = rotation_matrix(-self.tilt) @ R @ rotation_matrix(self.tilt)
 
         return R
 
@@ -464,6 +487,51 @@ class Dipole(Element):
 
         return tm
 
+    def split(self, resolution: torch.Tensor) -> list[Element]:
+        # TODO: Implement splitting for dipole properly, for now just returns the
+        # element itself
+        return [self]
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(length={repr(self.length)}, "
+            + f"p0c_ref={repr(self.p0c_ref)}, "
+            + f"ref_track={repr(self.ref_track)}, "
+            + f"angle={repr(self.angle)}, "
+            + f"k1={repr(self.k1)}, "
+            + f"dipole_e1={repr(self.dipole_e1)},"
+            + f"dipole_e2={repr(self.dipole_e2)},"
+            + f"tilt={repr(self.tilt)},"
+            + f"gap={repr(self.gap)},"
+            + f"gap_exit={repr(self.gap_exit)},"
+            + f"fringe_integral={repr(self.fringe_integral)},"
+            + f"fringe_integral_exit={repr(self.fringe_integral_exit)},"
+            + f"fringe_at={repr(self.fringe_at)},"
+            + f"fringe_type={repr(self.fringe_type)},"
+            + f"tracking_method={repr(self.tracking_method)}, "
+            + f"name={repr(self.name)})"
+        )
+
+    @property
+    def defining_features(self) -> list[str]:
+        return super().defining_features + [
+            "length",
+            "p0c_ref",
+            "ref_track",
+            "angle",
+            "k1",
+            "dipole_e1",
+            "dipole_e2",
+            "tilt",
+            "gap",
+            "gap_exit",
+            "fringe_integral",
+            "fringe_integral_exit",
+            "fringe_at",
+            "fringe_type",
+            "tracking_method",
+        ]
+
     def plot(
         self, s: float, vector_idx: tuple | None = None, ax: plt.Axes | None = None
     ) -> plt.Axes:
@@ -480,65 +548,3 @@ class Dipole(Element):
             (plot_s, 0), plot_length, height, color="tab:green", alpha=alpha, zorder=2
         )
         ax.add_patch(patch)
-
-    def to_mesh(
-        self, cuteness: float | dict = 1.0, show_download_progress: bool = True
-    ) -> "tuple[trimesh.Trimesh | None, np.ndarray]":  # noqa: F821 # type: ignore
-        # Import only here because most people will not need it
-        import trimesh
-
-        mesh, output_transform = super().to_mesh(
-            cuteness=cuteness, show_download_progress=show_download_progress
-        )
-
-        # Rotate the mesh by half the bending angle
-        mesh_rotation = trimesh.transformations.rotation_matrix(
-            self.angle.item() / 2.0, [0, 1, 0], [0, 0, 0]
-        )
-        mesh.apply_transform(mesh_rotation)
-
-        # Rotate the output transform by the full bending angle
-        output_transform = (
-            trimesh.transformations.rotation_matrix(
-                self.angle.item(), [0, 1, 0], [0, 0, 0]
-            )
-            @ output_transform
-        )
-
-        return mesh, output_transform
-
-    @property
-    def defining_features(self) -> list[str]:
-        return super().defining_features + [
-            "length",
-            "angle",
-            "k1",
-            "dipole_e1",
-            "dipole_e2",
-            "tilt",
-            "gap",
-            "gap_exit",
-            "fringe_integral",
-            "fringe_integral_exit",
-            "fringe_at",
-            "fringe_type",
-            "tracking_method",
-        ]
-
-    def __repr__(self):
-        return (
-            f"{self.__class__.__name__}(length={repr(self.length)}, "
-            + f"angle={repr(self.angle)}, "
-            + f"k1={repr(self.k1)}, "
-            + f"dipole_e1={repr(self.dipole_e1)},"
-            + f"dipole_e2={repr(self.dipole_e2)},"
-            + f"tilt={repr(self.tilt)},"
-            + f"gap={repr(self.gap)},"
-            + f"gap_exit={repr(self.gap_exit)},"
-            + f"fringe_integral={repr(self.fringe_integral)},"
-            + f"fringe_integral_exit={repr(self.fringe_integral_exit)},"
-            + f"fringe_at={repr(self.fringe_at)},"
-            + f"fringe_type={repr(self.fringe_type)},"
-            + f"tracking_method={repr(self.tracking_method)}, "
-            + f"name={repr(self.name)})"
-        )
